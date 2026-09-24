@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地运行时数据（凭证哈希与配额计数）
+data/
