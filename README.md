@@ -14,6 +14,9 @@
 | 权限范围 | 按调用方持有 scope 判定，越权 403，与未认证 401 严格区分 |
 | 公开接口 | `GET /` 无需鉴权，启用后响应契约仍为 `{"Hello": "World"}` |
 | 访问配额 | 按调用方固定窗口计数；配额内放行，超额 429 并带 `Retry-After` |
+| 在线调额 | 不重启服务即可调高/调低某调用方上限，立即生效，已用量保留 |
+| 自助查询 | `GET /me/quota` 凭自身凭证查已用/剩余/上限/窗口重开时间，不耗配额 |
+| 窗口边界 | 清零与窗口起点更新在锁内同一步完成，边界并发请求只落入一个窗口 |
 | 并发安全 | 进程内锁 + `fcntl` 文件锁串行化“读-判-写”，并发绝不突破限额 |
 | 重启延续 | 凭证/吊销/配额均落盘，重启后已消耗配额不会静默重置 |
 | 可解释日志 | `auth` logger 输出 key_id、判定原因、`配额=used/limit`、retry_after |
@@ -56,6 +59,11 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" \
 # 查询凭证元数据 / 查询某调用方配额
 curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:8000/admin/keys
 curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:8000/admin/keys/quotas/alice
+
+# 在线调额：把 alice 的每窗口上限调整为 200（立即生效，已用量保留）
+curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"limit":200}' \
+  http://127.0.0.1:8000/admin/keys/quotas/alice
 ```
 
 磁盘布局（默认 `./data/`，已加入 `.gitignore`）：
@@ -82,6 +90,7 @@ curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:8000/admin/keys/q
 
 - scope 是不透明字符串（如 `data:read`、`data:write`、`admin`），凭证签发时给定；
 - `GET /me` 只要求**有效凭证**，不要求具体 scope；
+- `GET /me/quota` 同样只要求有效凭证，且**不消耗**业务配额（详见“调用方自助查询”）；
 - `GET /data/read` 要求 `data:read`；`POST /data/write` 要求 `data:write`；
 - scope 按凭证持有，配额按 `caller_id` 计量——同一调用方的多把凭证共享一份配额；
 - 越权等被拒请求不消耗配额。
@@ -98,6 +107,58 @@ curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:8000/admin/keys/q
   不会突破；
 - **重启保证**：每次计数成功都立即原子落盘，服务重启从文件恢复，
   已消耗配额不会被静默重置（测试 `test_quota_persists_across_restart` 覆盖）。
+
+### 在线调额（不重启服务）
+
+`PUT /admin/keys/quotas/{caller_id}`，请求体 `{"limit": <新上限>}`（需 `admin` 范围，
+`limit >= 1`，未知调用方返回 404）。规则：
+
+- **立即生效**：响应返回后的下一个请求即按新上限判定；
+- **已用量保留**：调额只改 `limit`，绝不清零 `count`；
+- **调低到低于已用量**：后续请求继续按超额拒绝（429），`Retry-After`
+  仍给出当前窗口剩余秒数，是明确的重试时间依据；窗口重开后按新上限计量；
+- **并发安全**：调额与业务请求、多个调额之间都在同一把锁内串行，
+  不超发、不丢计数；并发调额的最终结果为其中某一次写入；
+- 调额本身不消耗业务配额，且会记录 `quota limit updated` 日志（旧值→新值、当前已用）。
+
+### 调用方自助查询
+
+`GET /me/quota`：任何持有有效凭证的调用方都可以查询**自己的**配额使用情况，
+无需 `admin` 范围，且查询本身**不消耗业务配额**（超额后仍可查询）。响应示例：
+
+```json
+{
+  "caller_id": "alice",
+  "limit": 100,
+  "used": 37,
+  "remaining": 63,
+  "window_start": "2026-10-05T07:00:00+00:00",
+  "window_reset_at": "2026-10-05T08:00:00+00:00",
+  "retry_after_seconds": 3540
+}
+```
+
+其中 `window_reset_at` 为当前窗口重开时间，`retry_after_seconds` 为距重开的秒数。
+管理员查询任意调用方仍用 `GET /admin/keys/quotas/{caller_id}`（响应字段与上表一致，
+另含 `found` 标记）。
+
+### 窗口边界语义
+
+- 窗口为固定窗口，边界按窗口长度对齐：窗口重开时**清零计数与更新窗口起点
+  在同一把锁内的同一步完成**，不会出现“计数已清但起点未动”的中间态；
+- 边界前后并发进入的请求各自落在**恰好一个**窗口里：取时、判定、计数、落盘
+  整体串行，不会漏记也不会重复计入；
+- 查询类接口（`/me/quota`、管理员配额查询）在窗口已过期时按“已滚动到当前窗口”
+  的视图返回（已用归零、起点对齐），真正的状态滚动在下一次计数时原子落盘。
+
+### 兼容范围
+
+本次新增能力不改变既有公开接口的行为与失败判定规则：
+
+- 既有端点的路径、请求/响应契约、401/403/429 判定顺序与响应头保持不变；
+- 管理员配额查询 `GET /admin/keys/quotas/{caller_id}` 仅**新增**只读字段
+  （`window_reset_at`、`retry_after_seconds`），原有字段含义不变；
+- 既有持久化文件格式不变，旧数据目录可直接沿用。
 
 ## 配置（环境变量）
 
@@ -118,8 +179,11 @@ curl -s -H "Authorization: Bearer $ADMIN_KEY" http://127.0.0.1:8000/admin/keys/q
 ./scripts/local_verify.sh
 ```
 
-脚本依次验证：公开接口契约、401/403 区分、签发、10 并发打限额 3
-（恰好 3 个 200、8 个 429）、配额查询、**重启后仍 429**、吊销拒绝。
+脚本依次验证：公开接口契约、401/403 区分、签发、并发不超限
+（`/me` 已耗 1 次后 10 并发打剩余 2 的限额，恰好 2 个 200、8 个 429，脚本会断言该数字）、
+配额查询、**自助查询不耗配额**、**在线调高 3→5 立即生效**、**在线调低到 1 后仍 429 且带
+`Retry-After`**、**重启后仍 429**、吊销拒绝。脚本使用临时数据目录，退出自动清理，
+可重复运行且不在工作区残留运行时数据。
 
 单元/集成测试（TestClient，包含并发、过期、吊销、越权、重启延续、日志内容断言）：
 
@@ -134,6 +198,10 @@ uv run pytest -q
 - `tests/test_scopes.py`：scope 模型与 401/403 区分；
 - `tests/test_quota.py`：配额放行/拒绝、**并发接近限额不突破**、按调用方隔离、
   窗口重置、**重启后配额延续**；
+- `tests/test_quota_adjust.py`：**在线调额**（调高立即生效、调低到低于已用仍 429 且带
+  `Retry-After`、调额与业务请求并发不超发不丢计数、多调额并发串行）、
+  **调用方自助查询**（无需 admin、不耗配额、字段完整）、
+  **窗口边界并发**（请求恰好落入一个窗口，清零与起点更新同时生效）；
 - `tests/test_restart_and_logging.py`：吊销/轮换的重启延续，
   以及日志包含 key_id、判定原因、配额计数（`caplog` 断言）。
 

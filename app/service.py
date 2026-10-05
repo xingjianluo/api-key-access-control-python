@@ -3,7 +3,9 @@
 职责：
 1. 凭证生命周期：签发 / 轮换 / 吊销，只存 SHA-256 哈希；
 2. 权限判定：按 scope 拒绝越权，与未认证可区分；
-3. 访问配额：按调用方固定窗口计数，并发下不超限，重启后延续。
+3. 访问配额：按调用方固定窗口计数，并发下不超限，重启后延续；
+4. 在线调额：不重启调整调用方上限，立即生效且已用量保留；
+5. 配额视图：只读查询已用/剩余/上限/窗口重开时间，不消耗配额。
 
 所有鉴权结论均通过名为 ``auth`` 的 logger 输出：
 凭证标识（key_id）、判定依据（reason）、配额计数（used/limit）。
@@ -192,6 +194,80 @@ class AuthService:
         with self.store.locked():
             return self.store.load_quotas().get(caller_id)
 
+    # ---------- 配额视图与在线调额 ----------
+
+    def quota_view(self, caller_id: str) -> dict | None:
+        """配额使用情况的只读视图（不落盘，不消耗配额）。
+
+        窗口已过期时在视图层面滚动到当前窗口：已用归零、窗口起点对齐，
+        并给出窗口重开时间与重试秒数。真正的状态滚动在下一次计数时
+        于锁内原子落盘。
+        """
+        with self.store.locked():
+            quota = self.store.load_quotas().get(caller_id)
+            if quota is None:
+                return None
+            return self._quota_view_dict(quota, self._clock())
+
+    def set_quota_limit(self, caller_id: str, new_limit: int) -> dict:
+        """在线调整某调用方的配额上限，立即生效，已用量保留。
+
+        - 调高/调低都只改 ``limit``，不动 ``count``；
+        - 若当前窗口已过期，先在锁内原子滚动窗口（清零 + 起点更新一起落盘）；
+        - 与正常业务请求、其他调额请求都在同一把锁内串行，
+          不超发、不丢计数；
+        - 新上限低于已用量时，后续请求按超额 429 拒绝，
+          ``Retry-After`` 由窗口剩余时间给出。
+        """
+        if new_limit < 1:
+            raise ValueError("quota limit must be >= 1")
+        with self.store.locked():
+            quotas = self.store.load_quotas()
+            quota = quotas.get(caller_id)
+            if quota is None:
+                raise KeyError(f"unknown caller_id: {caller_id}")
+            now = self._clock()
+            quota = self._roll_forward(quota, now)
+            old_limit = quota.limit
+            quota.limit = new_limit
+            quotas[caller_id] = quota
+            self.store.save_quotas(quotas)
+            view = self._quota_view_dict(quota, now)
+
+        logger.info(
+            "quota limit updated | caller_id=%s limit=%d->%d used=%d window_start=%s",
+            caller_id, old_limit, new_limit, quota.count, quota.window_start,
+        )
+        return view
+
+    def _quota_view_dict(self, quota: QuotaState, now: datetime) -> dict:
+        effective = self._roll_forward(quota, now)
+        window = timedelta(seconds=self.settings.default_quota_window_seconds)
+        reset_at = effective.window_start + window
+        retry_after = max(int((reset_at - now).total_seconds()), 0)
+        return {
+            "caller_id": effective.caller_id,
+            "limit": effective.limit,
+            "used": effective.count,
+            "remaining": max(effective.limit - effective.count, 0),
+            "window_start": effective.window_start.isoformat(),
+            "window_reset_at": reset_at.isoformat(),
+            "retry_after_seconds": retry_after,
+        }
+
+    def _roll_forward(self, quota: QuotaState, now: datetime) -> QuotaState:
+        """窗口过期时把状态滚动到当前窗口：清零与起点更新在同一步完成。
+
+        窗口起点按窗口长度对齐（保持固定边界），调用方需处于锁内；
+        该函数只改内存对象，是否落盘由调用方决定。
+        """
+        window = timedelta(seconds=self.settings.default_quota_window_seconds)
+        if now - quota.window_start >= window:
+            elapsed = (now - quota.window_start) // window
+            quota.window_start = quota.window_start + elapsed * window
+            quota.count = 0
+        return quota
+
     # ---------- 首次启动引导 ----------
 
     def bootstrap_admin(self) -> str | None:
@@ -310,10 +386,9 @@ class AuthService:
             )
 
         window = timedelta(seconds=self.settings.default_quota_window_seconds)
-        if now - quota.window_start >= window:
-            # 进入新窗口：计数清零
-            quota.window_start = now
-            quota.count = 0
+        # 窗口重开：清零与窗口起点更新在锁内同一步完成，
+        # 边界前后的请求只会落入恰好一个窗口。
+        quota = self._roll_forward(quota, now)
 
         if quota.count >= quota.limit:
             retry_after = int(

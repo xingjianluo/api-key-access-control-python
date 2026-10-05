@@ -28,6 +28,12 @@ class RotateRequest(BaseModel):
     ttl_seconds: int | None = Field(default=None, ge=1)
 
 
+class QuotaAdjustRequest(BaseModel):
+    """在线调额请求体：只含新上限，已用量保留。"""
+
+    limit: int = Field(ge=1)
+
+
 def _credential_view(credential) -> dict:
     return {
         "key_id": credential.key_id,
@@ -105,14 +111,18 @@ def get_quota_endpoint(
     service: AuthService = Depends(get_service),
     _: Principal = Depends(require_scope("admin", consume_quota=False)),
 ) -> dict:
-    quota = service.get_quota(caller_id)
-    if quota is None:
+    view = service.quota_view(caller_id)
+    if view is None:
         return {"caller_id": caller_id, "found": False}
-    return {
-        "caller_id": quota.caller_id,
-        "found": True,
-        "limit": quota.limit,
-        "used": quota.count,
-        "remaining": max(quota.limit - quota.count, 0),
-        "window_start": quota.window_start.isoformat(),
-    }
+    return {"found": True, **view}
+
+
+@router.put("/quotas/{caller_id}")
+def adjust_quota_endpoint(
+    caller_id: str,
+    payload: QuotaAdjustRequest,
+    service: AuthService = Depends(get_service),
+    _: Principal = Depends(require_scope("admin", consume_quota=False)),
+) -> dict:
+    """在线调整配额上限：立即生效，已用量保留，不重启服务。"""
+    return service.set_quota_limit(caller_id, payload.limit)

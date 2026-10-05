@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+
+# main 模块在导入时会用默认配置构造一次模块级 app；
+# 将其数据目录重定向到临时位置，避免在工作区残留运行时数据文件。
+os.environ.setdefault(
+    "AUTH_DATA_DIR", tempfile.mkdtemp(prefix="auth-module-app-")
+)
 
 import pytest
 from fastapi.testclient import TestClient
