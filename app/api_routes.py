@@ -33,6 +33,29 @@ def me_endpoint(principal: Principal = Depends(require_scope(None))) -> dict:
     }
 
 
+@router.get("/me/quota")
+def my_quota_endpoint(
+    principal: Principal = Depends(require_scope(None, consume_quota=False)),
+    service: AuthService = Depends(get_service),
+) -> dict:
+    """调用方自助查询自己的配额使用情况。
+
+    只需有效凭证，不要求具体 scope，也不消耗业务配额。
+    """
+    view = service.describe_quota(principal.caller_id)
+    if view is None:  # 理论上不会发生：凭证签发时即初始化配额
+        return {"caller_id": principal.caller_id, "found": False}
+    return {
+        "caller_id": view.caller_id,
+        "found": True,
+        "limit": view.limit,
+        "used": view.used,
+        "remaining": view.remaining,
+        "window_start": view.window_start.isoformat(),
+        "window_reset_at": view.window_reset_at.isoformat(),
+    }
+
+
 @router.get("/data/read")
 def read_data_endpoint(
     principal: Principal = Depends(require_scope("data:read")),

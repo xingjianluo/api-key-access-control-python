@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.deps import require_scope
@@ -26,6 +26,10 @@ class IssueRequest(BaseModel):
 
 class RotateRequest(BaseModel):
     ttl_seconds: int | None = Field(default=None, ge=1)
+
+
+class QuotaAdjustRequest(BaseModel):
+    limit: int = Field(ge=1)
 
 
 def _credential_view(credential) -> dict:
@@ -111,6 +115,33 @@ def get_quota_endpoint(
     return {
         "caller_id": quota.caller_id,
         "found": True,
+        "limit": quota.limit,
+        "used": quota.count,
+        "remaining": max(quota.limit - quota.count, 0),
+        "window_start": quota.window_start.isoformat(),
+    }
+
+
+@router.put("/quotas/{caller_id}")
+def adjust_quota_endpoint(
+    caller_id: str,
+    payload: QuotaAdjustRequest,
+    service: AuthService = Depends(get_service),
+    _: Principal = Depends(require_scope("admin", consume_quota=False)),
+) -> dict:
+    """在线调整调用方配额上限：立即生效，已用量保留。"""
+    try:
+        quota = service.adjust_quota_limit(caller_id, payload.limit)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "unknown_caller_id",
+                "message": f"unknown caller_id: {caller_id}",
+            },
+        )
+    return {
+        "caller_id": quota.caller_id,
         "limit": quota.limit,
         "used": quota.count,
         "remaining": max(quota.limit - quota.count, 0),

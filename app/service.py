@@ -16,7 +16,14 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from app.config import Settings
-from app.models import Credential, FailReason, IssueResult, Principal, QuotaState
+from app.models import (
+    Credential,
+    FailReason,
+    IssueResult,
+    Principal,
+    QuotaState,
+    QuotaView,
+)
 from app.security import compare_secret, generate_key_id, generate_secret, hash_secret
 from app.storage import JsonStore
 
@@ -191,6 +198,65 @@ class AuthService:
     def get_quota(self, caller_id: str) -> QuotaState | None:
         with self.store.locked():
             return self.store.load_quotas().get(caller_id)
+
+    def adjust_quota_limit(self, caller_id: str, new_limit: int) -> QuotaState:
+        """在线调整调用方配额上限，立即生效，无需重启。
+
+        - 已消耗计数（``count``）与窗口起点原样保留，调额不会清零已用量；
+        - 调低后若新上限低于已用量，后续请求继续按超额拒绝，
+          ``retry_after`` 仍按当前窗口剩余时间计算；
+        - 整个“读-改-写”在与业务请求相同的锁内完成，
+          调额与业务请求并发、多个调额并发都不会超发或丢计数；
+        - 若窗口已过期，先按窗口规则滚动（清零+更新起点，一起落盘）再调额。
+        """
+        if new_limit < 1:
+            raise ValueError(f"quota limit must be >= 1, got {new_limit}")
+        with self.store.locked():
+            quotas = self.store.load_quotas()
+            quota = quotas.get(caller_id)
+            if quota is None:
+                raise KeyError(f"unknown caller_id: {caller_id}")
+
+            now = self._clock()
+            window = timedelta(seconds=self.settings.default_quota_window_seconds)
+            if now - quota.window_start >= window:
+                quota.window_start = now
+                quota.count = 0
+
+            old_limit = quota.limit
+            quota.limit = new_limit
+            quotas[caller_id] = quota
+            self.store.save_quotas(quotas)
+
+        logger.info(
+            "quota limit adjusted | caller_id=%s limit=%d->%d used=%d window_start=%s",
+            caller_id, old_limit, new_limit, quota.count, quota.window_start,
+        )
+        return quota
+
+    def describe_quota(self, caller_id: str) -> QuotaView | None:
+        """配额使用视图：只读，不计数、不落盘、不消耗业务配额。
+
+        窗口已过期但尚无新请求到达时，按有效状态展示（used=0），
+        此时 ``window_reset_at`` 为已过去的原窗口终点，
+        即“窗口已结束，下一请求到达即重开”。
+        """
+        with self.store.locked():
+            quota = self.store.load_quotas().get(caller_id)
+            now = self._clock()
+        if quota is None:
+            return None
+        window = timedelta(seconds=self.settings.default_quota_window_seconds)
+        window_reset_at = quota.window_start + window
+        used = quota.count if now < window_reset_at else 0
+        return QuotaView(
+            caller_id=caller_id,
+            limit=quota.limit,
+            used=used,
+            remaining=max(quota.limit - used, 0),
+            window_start=quota.window_start,
+            window_reset_at=window_reset_at,
+        )
 
     # ---------- 首次启动引导 ----------
 

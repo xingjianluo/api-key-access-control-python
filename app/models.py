@@ -46,6 +46,22 @@ class QuotaState:
 
 
 @dataclass(frozen=True)
+class QuotaView:
+    """配额使用的只读视图（用于调用方自助查询，不改变任何状态）。
+
+    ``window_reset_at`` 为当前窗口的重开时刻；若该时刻已过去，
+    表示窗口已结束，下一个业务请求到达时即重开新窗口。
+    """
+
+    caller_id: str
+    limit: int
+    used: int
+    remaining: int
+    window_start: datetime
+    window_reset_at: datetime
+
+
+@dataclass(frozen=True)
 class Principal:
     """鉴权通过后注入请求上下文的调用方身份。"""
 
